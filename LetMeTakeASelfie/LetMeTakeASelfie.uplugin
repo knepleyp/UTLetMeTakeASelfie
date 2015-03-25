@@ -1,0 +1,23 @@
+{
+	"FileVersion" : 3,
+	
+	"FriendlyName" : "Let Me Take A Selfie",
+	"Version" : 1,
+	"VersionName" : "1.0",
+	"CreatedBy" : "Epic Games, Inc.",
+	"CreatedByURL" : "http://epicgames.com",
+	"EngineVersion" : "4.7.0",
+	"Description" : "Selfie Cam",
+	"Category" : "UnrealTournament.Mod",
+	"EnabledByDefault" : true,
+	"CanContainContent" : true,
+	
+	"Modules" :
+	[
+		{
+			"Name" : "LetMeTakeASelfie",
+			"Type" : "Runtime",
+			"WhitelistPlatforms" : [ "Win32", "Win64" ]
+		}
+	]
+}
