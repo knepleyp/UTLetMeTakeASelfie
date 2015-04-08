@@ -36,7 +36,6 @@ struct FLetMeTakeASelfie : FTickableGameObject, FSelfRegisteringExec
 
 	TMap< UWorld*, USceneCaptureComponent2D* > WorldToSceneCaptureComponentMap;
 	UWorld* SelfieWorld;
-	bool bTakingSelfie;
 	bool bTakingAnimatedSelfie;
 	float SelfieTimeTotal;
 	int32 SelfieFrames;
@@ -45,6 +44,12 @@ struct FLetMeTakeASelfie : FTickableGameObject, FSelfRegisteringExec
 	float SelfieFrameDelay;
 	float SelfieDeltaTimeAccum;
 	bool bStartedAnimatedWritingTask;
+	int32 SelfieWidth;
+	int32 SelfieHeight;
+	int32 SelfieFrameRate;
+
+	// Capturing in a ring buffer, this is the current head
+	int32 HeadFrame;
 
 	// Currently never cleaned up, gdImageFree was very expensive when run from a worker thread
 	TArray<gdImagePtr> SelfieImages;
@@ -57,4 +62,51 @@ struct FLetMeTakeASelfie : FTickableGameObject, FSelfRegisteringExec
 	void ReadPixelsAsync(FRenderTarget* RenderTarget);
 	
 	void WriteWebM();
+};
+
+
+/* Based on https://wiki.unrealengine.com/Multi-Threading:_How_to_Create_Threads_in_UE4 */
+class FWriteWebMSelfieWorker : public FRunnable
+{
+	FWriteWebMSelfieWorker(FLetMeTakeASelfie* InLetMeTakeASelfie)
+	: LetMeTakeASelfie(InLetMeTakeASelfie)
+	{
+		Thread = FRunnableThread::Create(this, TEXT("FWriteWebMSelfieWorker"), 0, TPri_BelowNormal);
+	}
+
+	~FWriteWebMSelfieWorker()
+	{
+		delete Thread;
+		Thread = nullptr;
+
+	}
+
+	uint32 Run()
+	{
+		LetMeTakeASelfie->WriteWebM();
+
+		return 0;
+	}
+
+public:
+	static FWriteWebMSelfieWorker* RunWorkerThread(FLetMeTakeASelfie* InLetMeTakeASelfie)
+	{
+		if (Runnable)
+		{
+			delete Runnable;
+			Runnable = nullptr;
+		}
+
+		if (Runnable == nullptr)
+		{
+			Runnable = new FWriteWebMSelfieWorker(InLetMeTakeASelfie);
+		}
+
+		return Runnable;
+	}
+
+private:
+	FLetMeTakeASelfie* LetMeTakeASelfie;
+	FRunnableThread* Thread;
+	static FWriteWebMSelfieWorker* Runnable;
 };
