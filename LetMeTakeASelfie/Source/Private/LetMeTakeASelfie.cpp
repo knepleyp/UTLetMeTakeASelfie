@@ -4,6 +4,13 @@
 #include "UnrealTournament.h"
 #include "UTPlayerController.h"
 #include "UTGameState.h"
+#include "UTCTFGameState.h"
+
+#include "SlateBasics.h"
+#include "ScreenRendering.h"
+#include "RenderCore.h"
+#include "RHIStaticStates.h"
+#include "RendererInterface.h"
 
 #include "vpx/vpx_encoder.h"
 #include "vpx/vp8cx.h"
@@ -23,18 +30,30 @@ FLetMeTakeASelfie::FLetMeTakeASelfie()
 	bTakingAnimatedSelfie = false;
 	SelfieTimeWaited = 0;
 	PreviousImage = nullptr;
-	SelfieFrameRate = 15;
+	SelfieFrameRate = 30;
+	const float SelfieLength = 6.0f;
 	SelfieFrameDelay = 1.0f / SelfieFrameRate;
-	SelfieFramesMax = 6.0f / SelfieFrameDelay;
+	SelfieFramesMax = SelfieLength / SelfieFrameDelay;
 	SelfieDeltaTimeAccum = 0;
 	SelfieFrames = 0;
 	HeadFrame = 0;
 	bStartedAnimatedWritingTask = false;
 	bWaitingOnSelfieSurfData = false;
 	bSelfieSurfDataReady = false;
+	RecordedNumberOfScoringPlayers = 0;
+	DelayedEventWriteTimer = 0;
+	bFirstPerson = false;
 
 	SelfieWidth = 1280;
 	SelfieHeight = 720;
+	//SelfieWidth = 1024;
+	//SelfieHeight = 576;
+
+	bRegisteredSlateDelegate = false;
+	ReadbackTextureIndex = 0;
+	ReadbackBufferIndex = 0;
+	ReadbackBuffers[0] = nullptr;
+	ReadbackBuffers[1] = nullptr;
 }
 
 void FLetMeTakeASelfie::OnWorldCreated(UWorld* World, const UWorld::InitializationValues IVS)
@@ -45,7 +64,38 @@ void FLetMeTakeASelfie::OnWorldCreated(UWorld* World, const UWorld::Initializati
 	CaptureComponent->TextureTarget = NewObject<UTextureRenderTarget2D>();
 	CaptureComponent->TextureTarget->InitCustomFormat(SelfieWidth, SelfieHeight, PF_B8G8R8A8, false);
 	CaptureComponent->TextureTarget->ClearColor = FLinearColor::Black;
+	CaptureComponent->SetVisibility(false);
 	WorldToSceneCaptureComponentMap.Add(World, CaptureComponent);
+
+	if (!bRegisteredSlateDelegate)
+	{
+		FSlateRenderer* SlateRenderer = FSlateApplication::Get().GetRenderer().Get();
+		SlateRenderer->OnSlateWindowRendered().AddRaw(this, &FLetMeTakeASelfie::OnSlateWindowRenderedDuringCapture);
+		bRegisteredSlateDelegate = true;
+
+		// Setup readback buffer textures
+		{
+			for (int32 TextureIndex = 0; TextureIndex < 2; ++TextureIndex)
+			{
+				FRHIResourceCreateInfo CreateInfo;
+				ReadbackTextures[TextureIndex] = RHICreateTexture2D(
+					SelfieWidth,
+					SelfieHeight,
+					PF_B8G8R8A8,
+					1,
+					1,
+					TexCreate_CPUReadback,
+					CreateInfo
+					);
+			}
+
+			ReadbackTextureIndex = 0;
+
+			ReadbackBuffers[0] = nullptr;
+			ReadbackBuffers[1] = nullptr;
+			ReadbackBufferIndex = 0;
+		}
+	}
 
 	if (IVS.bInitializeScenes)
 	{
@@ -74,23 +124,44 @@ void FLetMeTakeASelfie::OnWorldDestroyed(UWorld* World)
 	if (SelfieWorld == World)
 	{
 		bTakingAnimatedSelfie = false;
+		RecordedNumberOfScoringPlayers = 0;
 		SelfieWorld = nullptr;
 	}
 }
 
 FWriteWebMSelfieWorker* FWriteWebMSelfieWorker::Runnable = nullptr;
 \
-bool FLetMeTakeASelfie::Exec(UWorld* Inworld, const TCHAR* Cmd, FOutputDevice& Ar)
+bool FLetMeTakeASelfie::Exec(UWorld* InWorld, const TCHAR* Cmd, FOutputDevice& Ar)
 {
 	if (FParse::Command(&Cmd, TEXT("SELFIEANIM")))
 	{
-		if (bTakingAnimatedSelfie)
+		if (bTakingAnimatedSelfie && SelfieWorld != InWorld)
 		{
+			// Already in a different world
 			return true;
 		}
 
-		SelfieWorld = Inworld;
+		SelfieWorld = InWorld;
 		bTakingAnimatedSelfie = true;
+
+		if (FParse::Command(&Cmd, TEXT("FPS")))
+		{
+			bFirstPerson = true;
+		}
+		else
+		{
+			bFirstPerson = false;
+		}
+
+		USceneCaptureComponent2D* CaptureComponent = WorldToSceneCaptureComponentMap.FindChecked(InWorld);
+		if (bFirstPerson)
+		{
+			CaptureComponent->SetVisibility(false);
+		}
+		else
+		{
+			CaptureComponent->SetVisibility(true);
+		}
 
 		return true;
 	}
@@ -112,9 +183,8 @@ bool FLetMeTakeASelfie::Exec(UWorld* Inworld, const TCHAR* Cmd, FOutputDevice& A
 
 void FLetMeTakeASelfie::ReadPixelsAsync(FRenderTarget* RenderTarget)
 {
-	SelfieSurfData.Empty(SelfieWidth * SelfieHeight);
-
 	FIntRect InRect(0, 0, RenderTarget->GetSizeXY().X, RenderTarget->GetSizeXY().Y);
+	SelfieSurfData.Empty(RenderTarget->GetSizeXY().X * RenderTarget->GetSizeXY().Y);
 	FReadSurfaceDataFlags InFlags(RCM_UNorm, CubeFace_MAX);
 
 	// Read the render target surface data back.	
@@ -171,6 +241,16 @@ void FLetMeTakeASelfie::Tick(float DeltaTime)
 		return;
 	}
 	
+	if (DelayedEventWriteTimer > 0)
+	{
+		DelayedEventWriteTimer -= DeltaTime;
+		if (DelayedEventWriteTimer < 0)
+		{
+			bStartedAnimatedWritingTask = true;
+			FWriteWebMSelfieWorker::RunWorkerThread(this);
+		}
+	}
+
 	if (bWaitingOnSelfieSurfData)
 	{
 		if (bSelfieSurfDataReady)
@@ -202,8 +282,43 @@ void FLetMeTakeASelfie::Tick(float DeltaTime)
 
 		if (UTPC && UTPC->GetPawn())
 		{
-			FVector NewLocation = UTPC->GetPawn()->GetActorLocation();
-			FRotator NewRotation = UTPC->GetPawn()->GetActorRotation();
+			APawn* Pawn = UTPC->GetPawn();
+
+			// Projectile following wasn't as cool as I wanted it to be
+			/*
+			if (!FollowingProjectile.IsValid())
+			{
+				for (TActorIterator<AUTProjectile> It(SelfieWorld); It; ++It)
+				{
+					if (!It->bFakeClientProjectile)
+					{
+						if (It->Instigator == Pawn && !It->bExploded)
+						{
+							FollowingProjectile = *It;
+						}
+					}
+				}
+			}
+
+			if (FollowingProjectile.IsValid())
+			{
+				FVector NewLocation = FollowingProjectile->GetActorLocation();
+				FRotator NewRotation = FollowingProjectile->GetActorRotation();
+				NewLocation += (NewRotation.RotateVector(FVector(-200, 0, 0)));
+				CaptureComponent->SetWorldLocationAndRotation(NewLocation, NewRotation, false);
+			}
+			else
+			{
+				FVector NewLocation = Pawn->GetActorLocation();
+				FRotator NewRotation = Pawn->GetActorRotation();
+				NewLocation += (NewRotation.RotateVector(FVector(200, 0, 100)));
+				NewRotation.Yaw += 180;
+				NewRotation.Pitch = -20;
+				CaptureComponent->SetWorldLocationAndRotation(NewLocation, NewRotation, false);
+			}*/
+
+			FVector NewLocation = Pawn->GetActorLocation();
+			FRotator NewRotation = Pawn->GetActorRotation();
 			NewLocation += (NewRotation.RotateVector(FVector(200, 0, 100)));
 			NewRotation.Yaw += 180;
 			NewRotation.Pitch = -20;
@@ -214,10 +329,27 @@ void FLetMeTakeASelfie::Tick(float DeltaTime)
 
 		if (!bWaitingOnSelfieSurfData && (SelfieFrames == 0 || SelfieDeltaTimeAccum > SelfieFrameDelay))
 		{
-			double StartTime = FPlatformTime::Seconds();
-			FRenderTarget* RenderTarget = CaptureComponent->TextureTarget->GameThread_GetRenderTargetResource();
-			ReadPixelsAsync(RenderTarget);
-			SelfieDeltaTimeAccum = 0;
+			if (!bFirstPerson)
+			{
+				FRenderTarget* RenderTarget = CaptureComponent->TextureTarget->GameThread_GetRenderTargetResource();
+				ReadPixelsAsync(RenderTarget);
+				SelfieDeltaTimeAccum = 0;
+			}
+		}
+				
+		// Try to autorecord if you cap the flag
+		AUTCTFGameState* GS = Cast<AUTCTFGameState>(SelfieWorld->GetGameState());
+		if (!bStartedAnimatedWritingTask && GS && UTPC->PlayerState)
+		{
+			if (RecordedNumberOfScoringPlayers < GS->GetScoringPlays().Num())
+			{
+				RecordedNumberOfScoringPlayers++;
+
+				if (GS->GetScoringPlays()[GS->GetScoringPlays().Num() - 1].ScoredBy.GetPlayerName() == UTPC->PlayerState->PlayerName)
+				{
+					DelayedEventWriteTimer = 2.0f;
+				}
+			}
 		}
 	}
 }
@@ -281,8 +413,8 @@ void ARGB_To_YV12(gdImagePtr Image, int nFrameWidth, int nFrameHeight, void *pFu
 
 void FLetMeTakeASelfie::WriteWebM()
 {		
-	int32 width = 1280;
-	int32 height = 720;
+	int32 width = SelfieWidth;
+	int32 height = SelfieHeight;
 
 	VpxVideoInfo info = { 0 };
 	FILE* file = nullptr;
@@ -304,7 +436,7 @@ void FLetMeTakeASelfie::WriteWebM()
 	cfg.rc_target_bitrate = width * height * cfg.rc_target_bitrate / cfg.g_w / cfg.g_h;
 	cfg.g_w = width;
 	cfg.g_h = height;
-	cfg.g_timebase.den = 15;
+	cfg.g_timebase.den = SelfieFrameRate;
 
 #define VP8_FOURCC 0x30385056
 	info.codec_fourcc = VP8_FOURCC;
@@ -411,4 +543,178 @@ void FLetMeTakeASelfie::WriteWebM()
 	SelfieFrames = 0;
 
 	UE_LOG(LogUTSelfie, Display, TEXT("Selfie complete!"));
+}
+
+// Borrowed from GameLiveStreaming.cpp
+void FLetMeTakeASelfie::OnSlateWindowRenderedDuringCapture(SWindow& SlateWindow, void* ViewportRHIPtr)
+{
+	UGameViewportClient* GameViewportClient = GEngine->GameViewport;
+	if (!bStartedAnimatedWritingTask && bTakingAnimatedSelfie && bFirstPerson && GameViewportClient != nullptr)
+	{
+		if (GameViewportClient->GetWindow() == SlateWindow.AsShared())
+		{
+			if (SelfieDeltaTimeAccum > SelfieFrameDelay)
+			{
+				CopyCurrentFrameToSavedFrames();
+
+				const FViewportRHIRef* ViewportRHI = (const FViewportRHIRef*)ViewportRHIPtr;
+				StartCopyingNextGameFrame(*ViewportRHI);
+				SelfieDeltaTimeAccum = 0;
+			}
+		}
+	}
+}
+
+void FLetMeTakeASelfie::CopyCurrentFrameToSavedFrames()
+{
+	if (ReadbackBuffers[ReadbackBufferIndex] != nullptr)
+	{
+		// Have a new buffer from the GPU
+		int i = 0;
+
+		gdImagePtr ScreenshotImage = SelfieImages[HeadFrame];
+		for (int y = 0; y < SelfieHeight; y++)
+		for (int x = 0; x < SelfieWidth; x++)
+		{
+			FColor& SurfData = ((FColor*)ReadbackBuffers[ReadbackBufferIndex])[i];
+			int Color = gdTrueColor(SurfData.R, SurfData.G, SurfData.B);
+			gdImageSetPixel(ScreenshotImage, x, y, Color);
+			i++;
+		}
+		SelfieFrames = FMath::Min(SelfieFrames + 1, SelfieFramesMax);
+		HeadFrame += 1;
+		HeadFrame %= SelfieFramesMax;
+
+		// Unmap the buffer now that we've pushed out the frame
+		{
+			struct FReadbackFromStagingBufferContext
+			{
+				FLetMeTakeASelfie* This;
+			};
+			FReadbackFromStagingBufferContext ReadbackFromStagingBufferContext =
+			{
+				this
+			};
+			ENQUEUE_UNIQUE_RENDER_COMMAND_ONEPARAMETER(
+				ReadbackFromStagingBuffer,
+				FReadbackFromStagingBufferContext, Context, ReadbackFromStagingBufferContext,
+				{
+				RHICmdList.UnmapStagingSurface(Context.This->ReadbackTextures[Context.This->ReadbackTextureIndex]);
+			});
+		}
+	}
+}
+
+void FLetMeTakeASelfie::StartCopyingNextGameFrame(const FViewportRHIRef& ViewportRHI)
+{
+	const FIntPoint ResizeTo(SelfieWidth, SelfieHeight);
+
+	static const FName RendererModuleName("Renderer");
+	IRendererModule& RendererModule = FModuleManager::GetModuleChecked<IRendererModule>(RendererModuleName);
+
+	UGameViewportClient* GameViewportClient = GEngine->GameViewport;
+	check(GameViewportClient != nullptr);
+
+	struct FCopyVideoFrame
+	{
+		FViewportRHIRef ViewportRHI;
+		IRendererModule* RendererModule;
+		FIntPoint ResizeTo;
+		FLetMeTakeASelfie* This;
+	};
+	FCopyVideoFrame CopyVideoFrame =
+	{
+		ViewportRHI,
+		&RendererModule,
+		ResizeTo,
+		this
+	};
+
+	ENQUEUE_UNIQUE_RENDER_COMMAND_ONEPARAMETER(
+		ReadSurfaceCommand,
+		FCopyVideoFrame, Context, CopyVideoFrame,
+		{
+		FPooledRenderTargetDesc OutputDesc(FPooledRenderTargetDesc::Create2DDesc(Context.ResizeTo, PF_B8G8R8A8, TexCreate_None, TexCreate_RenderTargetable, false));
+
+		const auto FeatureLevel = GMaxRHIFeatureLevel;
+
+		TRefCountPtr<IPooledRenderTarget> ResampleTexturePooledRenderTarget;
+		Context.RendererModule->RenderTargetPoolFindFreeElement(OutputDesc, ResampleTexturePooledRenderTarget, TEXT("ResampleTexture"));
+		check(ResampleTexturePooledRenderTarget);
+
+		const FSceneRenderTargetItem& DestRenderTarget = ResampleTexturePooledRenderTarget->GetRenderTargetItem();
+
+		SetRenderTarget(RHICmdList, DestRenderTarget.TargetableTexture, FTextureRHIRef());
+		RHICmdList.SetViewport(0, 0, 0.0f, Context.ResizeTo.X, Context.ResizeTo.Y, 1.0f);
+
+		RHICmdList.SetBlendState(TStaticBlendState<>::GetRHI());
+		RHICmdList.SetRasterizerState(TStaticRasterizerState<>::GetRHI());
+		RHICmdList.SetDepthStencilState(TStaticDepthStencilState<false, CF_Always>::GetRHI());
+
+		FTexture2DRHIRef ViewportBackBuffer = RHICmdList.GetViewportBackBuffer(Context.ViewportRHI);
+
+		auto ShaderMap = GetGlobalShaderMap(FeatureLevel);
+		TShaderMapRef<FScreenVS> VertexShader(ShaderMap);
+		TShaderMapRef<FScreenPS> PixelShader(ShaderMap);
+
+		static FGlobalBoundShaderState BoundShaderState;
+		SetGlobalBoundShaderState(RHICmdList, FeatureLevel, BoundShaderState, Context.RendererModule->GetFilterVertexDeclaration().VertexDeclarationRHI, *VertexShader, *PixelShader);
+
+		if (Context.ResizeTo != FIntPoint(ViewportBackBuffer->GetSizeX(), ViewportBackBuffer->GetSizeY()))
+		{
+			// We're scaling down the window, so use bilinear filtering
+			PixelShader->SetParameters(RHICmdList, TStaticSamplerState<SF_Bilinear>::GetRHI(), ViewportBackBuffer);
+		}
+		else
+		{
+			// Drawing 1:1, so no filtering needed
+			PixelShader->SetParameters(RHICmdList, TStaticSamplerState<SF_Point>::GetRHI(), ViewportBackBuffer);
+		}
+
+		Context.RendererModule->DrawRectangle(
+			RHICmdList,
+			0, 0,		// Dest X, Y
+			Context.ResizeTo.X, Context.ResizeTo.Y,	// Dest Width, Height
+			0, 0,		// Source U, V
+			1, 1,		// Source USize, VSize
+			Context.ResizeTo,		// Target buffer size
+			FIntPoint(1, 1),		// Source texture size
+			*VertexShader,
+			EDRF_Default);
+
+		// Asynchronously copy render target from GPU to CPU
+		const bool bKeepOriginalSurface = false;
+		RHICmdList.CopyToResolveTarget(
+			DestRenderTarget.TargetableTexture,
+			Context.This->ReadbackTextures[Context.This->ReadbackTextureIndex],
+			bKeepOriginalSurface,
+			FResolveParams());
+	});
+
+
+	// Start mapping the newly-rendered buffer
+	{
+		struct FReadbackFromStagingBufferContext
+		{
+			FLetMeTakeASelfie* This;
+		};
+		FReadbackFromStagingBufferContext ReadbackFromStagingBufferContext =
+		{
+			this
+		};
+		ENQUEUE_UNIQUE_RENDER_COMMAND_ONEPARAMETER(
+			ReadbackFromStagingBuffer,
+			FReadbackFromStagingBufferContext, Context, ReadbackFromStagingBufferContext,
+			{
+			int32 UnusedWidth = 0;
+			int32 UnusedHeight = 0;
+			RHICmdList.MapStagingSurface(Context.This->ReadbackTextures[Context.This->ReadbackTextureIndex], Context.This->ReadbackBuffers[Context.This->ReadbackBufferIndex], UnusedWidth, UnusedHeight);
+
+			// Ping pong between readback textures
+			Context.This->ReadbackTextureIndex = (Context.This->ReadbackTextureIndex + 1) % 2;
+		});
+	}
+
+	// Ping pong between readback buffers
+	ReadbackBufferIndex = (ReadbackBufferIndex + 1) % 2;
 }
