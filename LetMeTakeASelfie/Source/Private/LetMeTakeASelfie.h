@@ -4,7 +4,9 @@
 #include "Core.h"
 #include "UnrealTournament.h"
 
-#include "gd.h"
+#include "AllowWindowsPlatformTypes.h"
+#include <mmdeviceapi.h>
+#include <audioclient.h>
 
 #include "LetMeTakeASelfie.generated.h"
 
@@ -39,7 +41,6 @@ struct FLetMeTakeASelfie : FTickableGameObject, FSelfRegisteringExec
 	bool bTakingAnimatedSelfie;
 	float SelfieTimeTotal;
 	int32 SelfieFrames;
-	gdImagePtr PreviousImage;
 	int32 SelfieFramesMax;
 	float SelfieFrameDelay;
 	float SelfieDeltaTimeAccum;
@@ -56,11 +57,10 @@ struct FLetMeTakeASelfie : FTickableGameObject, FSelfRegisteringExec
 	TWeakObjectPtr<AUTProjectile> FollowingProjectile;
 	int32 RecordedNumberOfScoringPlayers;
 	float DelayedEventWriteTimer;
-
-	// Currently never cleaned up, gdImageFree was very expensive when run from a worker thread
-	TArray<gdImagePtr> SelfieImages;
-
+	
 	float SelfieTimeWaited;
+
+	TArray< TArray<FColor> > SelfieSurfaceImages;
 
 	TArray<FColor> SelfieSurfData;
 	bool bWaitingOnSelfieSurfData;
@@ -80,6 +80,20 @@ struct FLetMeTakeASelfie : FTickableGameObject, FSelfRegisteringExec
 	void OnSlateWindowRenderedDuringCapture(SWindow& SlateWindow, void* ViewportRHIPtr);
 	void CopyCurrentFrameToSavedFrames();
 	void StartCopyingNextGameFrame(const FViewportRHIRef& ViewportRHI);
+
+	// Audio stuff
+	IMMDevice* MMDevice;
+	IAudioClient* AudioClient;
+	IAudioCaptureClient* AudioCaptureClient;
+	WAVEFORMATEX* WFX;
+	int32 AudioBlockAlign;
+	TArray<int8> AudioData;
+	uint32 AudioDataLength;
+	uint32 AudioTotalFrames;
+	bool bCapturingAudio;
+	void InitAudioLoopback();
+	void StopAudioLoopback();
+	void ReadAudioLoopback();
 
 	void WriteWebM();
 };

@@ -16,6 +16,8 @@
 #include "vpx/vp8cx.h"
 #include "vpx/video_writer.h"
 #include "vpx/webmenc.h"
+#include "libyuv/convert.h"
+#include <mmsystem.h>
 
 DEFINE_LOG_CATEGORY_STATIC(LogUTSelfie, Log, All);
 
@@ -24,12 +26,243 @@ ALetMeTakeASelfie::ALetMeTakeASelfie(const FObjectInitializer& ObjectInitializer
 {
 }
 
+void FLetMeTakeASelfie::InitAudioLoopback()
+{
+	// Based on http://blogs.msdn.com/b/matthew_van_eerde/archive/2014/11/05/draining-the-wasapi-capture-buffer-fully.aspx
+
+	// We could use the windows method for prioritizing disk and cpu usage, seems like a great way to be a bad citizen though
+	// AvSetMmThreadCharacteristics
+
+	IMMDeviceEnumerator* DeviceEnumerator = nullptr;
+	const CLSID CLSID_MMDeviceEnumerator = __uuidof(MMDeviceEnumerator);
+	const IID IID_IMMDeviceEnumerator = __uuidof(IMMDeviceEnumerator);
+	HRESULT hr = CoCreateInstance(CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, IID_IMMDeviceEnumerator, (void**)&DeviceEnumerator);
+	if (hr == S_OK)
+	{
+		hr = DeviceEnumerator->GetDefaultAudioEndpoint(EDataFlow::eRender, ERole::eConsole, &MMDevice);
+		if (hr == S_OK && MMDevice != nullptr)
+		{
+			const IID IID_IAudioClient = __uuidof(IAudioClient);
+			hr = MMDevice->Activate(IID_IAudioClient, CLSCTX_ALL, nullptr, (void**)&AudioClient);
+			if (hr == S_OK && AudioClient)
+			{
+				// this must be free'd with CoTaskMemFreeLater
+				hr = AudioClient->GetMixFormat(&WFX);
+				if (hr == S_OK)
+				{
+					// May need to create a silent audio stream to work around an issue from 2008, hopefully not anymore
+					// https://social.msdn.microsoft.com/Forums/windowsdesktop/en-US/c7ba0a04-46ce-43ff-ad15-ce8932c00171/loopback-recording-causes-digital-stuttering?forum=windowspro-audiodevelopment
+
+					// Adjust the desired WFX for capture to 16 bit PCM, not sure if necessary, makes writing to wave file for testing nice though
+					if (WFX->wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+					{
+						WAVEFORMATEXTENSIBLE* WFEX = (WAVEFORMATEXTENSIBLE*)WFX;
+						if (IsEqualGUID(KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WFEX->SubFormat))
+						{
+							WFEX->SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
+							WFX->wBitsPerSample = 16;
+							WFEX->Samples.wValidBitsPerSample = WFX->wBitsPerSample;
+							WFX->nBlockAlign = WFX->nChannels * WFX->wBitsPerSample / 8;
+							WFX->nAvgBytesPerSec = WFX->nBlockAlign * WFX->nSamplesPerSec;
+						}
+					}
+					else if (WFX->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
+					{
+						WFX->wFormatTag = WAVE_FORMAT_PCM;
+						WFX->wBitsPerSample = 16;
+						WFX->nBlockAlign = WFX->nChannels * WFX->wBitsPerSample / 8;
+						WFX->nAvgBytesPerSec = WFX->nBlockAlign * WFX->nSamplesPerSec;
+					}
+
+					AudioBlockAlign = WFX->nBlockAlign;
+
+					// Try allocating 50 megs for audiodata
+					AudioData.Empty(1024 * 1024 * 50);
+					AudioDataLength = 0;
+					AudioTotalFrames = 0;
+
+					// nanoseconds, value taken from windows sample
+					const int32 REFTIMES_PER_SEC = 10000000;
+
+					// Audio capture
+					REFERENCE_TIME hnsRequestedDuration = REFTIMES_PER_SEC;
+					hr = AudioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, hnsRequestedDuration, 0, WFX, 0);
+					if (hr == S_OK)
+					{
+						const IID IID_IAudioCaptureClient = __uuidof(IAudioCaptureClient);
+						hr = AudioClient->GetService(IID_IAudioCaptureClient, (void**)&AudioCaptureClient);
+						if (hr == S_OK && AudioCaptureClient)
+						{
+							hr = AudioClient->Start();
+							if (hr == S_OK)
+							{
+								bCapturingAudio = true;
+							}
+						}
+					}
+				}
+			}
+		}
+		DeviceEnumerator->Release();
+		DeviceEnumerator = nullptr;
+	}
+}
+
+void FLetMeTakeASelfie::ReadAudioLoopback()
+{
+	UINT32 NextPacketSize = 0;
+	HRESULT hr = AudioCaptureClient->GetNextPacketSize(&NextPacketSize);
+	if (hr == S_OK)
+	{
+		if (NextPacketSize > 0)
+		{
+			BYTE* Data;
+			UINT32 NumFramesRead;
+			DWORD Flags;
+			UINT64 QPCPosition;
+			hr = AudioCaptureClient->GetBuffer(&Data, &NumFramesRead, &Flags, nullptr, &QPCPosition);
+			if (hr == S_OK)
+			{
+				if (Flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)
+				{
+				}
+				
+				if (Flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR)
+				{
+				}
+
+				if (Flags & AUDCLNT_BUFFERFLAGS_SILENT)
+				{
+				}
+
+				uint32 DataSizeInBytes = NumFramesRead * AudioBlockAlign;
+				AudioTotalFrames += NumFramesRead;
+
+				if (1024 * 1024 * 50 - AudioDataLength > DataSizeInBytes)
+				{
+					int8* AudioStart = AudioData.GetData();
+					AudioStart += AudioDataLength;
+					FMemory::Memcpy(AudioStart, Data, DataSizeInBytes);
+					AudioDataLength += DataSizeInBytes;
+				}
+				else
+				{
+					// Buffer full
+				}
+
+				hr = AudioCaptureClient->ReleaseBuffer(NumFramesRead);
+			}
+		}
+		else
+		{
+			// NextPacketSize being 0 might mean silence depending on windows version, will fill this in if need be
+		}
+	}
+}
+
+void FLetMeTakeASelfie::StopAudioLoopback()
+{
+	if (bCapturingAudio)
+	{
+		// Write wave file for debug
+		MMCKINFO ckRIFF = { 0 };
+		MMCKINFO ckData = { 0 }; 
+		ckRIFF.ckid = MAKEFOURCC('R', 'I', 'F', 'F');
+		ckRIFF.fccType = MAKEFOURCC('W', 'A', 'V', 'E');
+
+		FString BasePath = FPaths::ScreenShotDir();
+		FString WavePath = BasePath / TEXT("audio.wav");
+		MMIOINFO mi = { 0 };
+		HMMIO hFile = mmioOpenA(TCHAR_TO_ANSI(*WavePath), &mi, MMIO_WRITE | MMIO_CREATE);
+		if (hFile)
+		{
+			MMRESULT mmr = mmioCreateChunk(hFile, &ckRIFF, MMIO_CREATERIFF);
+			if (mmr == MMSYSERR_NOERROR)
+			{
+				// fmt chunk
+				MMCKINFO chunk;
+				chunk.ckid = MAKEFOURCC('f', 'm', 't', ' ');
+				mmr = mmioCreateChunk(hFile, &chunk, 0);
+				if (mmr == MMSYSERR_NOERROR)
+				{
+					LONG BytesInWFX = sizeof(WAVEFORMATEX) + WFX->cbSize;
+					if (mmioWrite(hFile, (const char*)WFX, BytesInWFX) == BytesInWFX)
+					{
+						mmr = mmioAscend(hFile, &chunk, 0);
+						if (mmr == MMSYSERR_NOERROR)
+						{
+							// fact chunk
+							chunk.ckid = MAKEFOURCC('f', 'a', 'c', 't');
+							mmr = mmioCreateChunk(hFile, &chunk, 0);
+							if (mmr == MMSYSERR_NOERROR)
+							{
+								DWORD frames = AudioTotalFrames;
+								if (mmioWrite(hFile, (const char*)&frames, sizeof(frames)) == sizeof(frames))
+								{
+									mmr = mmioAscend(hFile, &chunk, 0);
+									if (mmr == MMSYSERR_NOERROR)
+									{
+										ckData.ckid = MAKEFOURCC('d', 'a', 't', 'a');
+										mmr = mmioCreateChunk(hFile, &ckData, 0);
+										if (mmr == MMSYSERR_NOERROR)
+										{
+											if (mmioWrite(hFile, (const char*)AudioData.GetData(), AudioDataLength) == AudioDataLength)
+											{
+												mmr = mmioAscend(hFile, &ckData, 0);
+												mmr = mmioAscend(hFile, &ckRIFF, 0);
+
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+
+			mmioClose(hFile, 0);
+		}
+	}
+
+	if (WFX)
+	{
+		// Should be done with WFX now
+		CoTaskMemFree(WFX);
+		WFX = nullptr;
+	}
+
+	bCapturingAudio = false;
+	if (AudioClient)
+	{
+		AudioClient->Stop();
+	}
+
+	if (AudioCaptureClient)
+	{
+		AudioCaptureClient->Release();
+		AudioCaptureClient = nullptr;
+	}
+
+	if (AudioClient)
+	{
+		AudioClient->Release();
+		AudioClient = nullptr;
+	}
+
+	if (MMDevice)
+	{
+		MMDevice->Release();
+		MMDevice = nullptr;
+	}
+}
+
 FLetMeTakeASelfie::FLetMeTakeASelfie()
 {
 	SelfieWorld = nullptr;
 	bTakingAnimatedSelfie = false;
 	SelfieTimeWaited = 0;
-	PreviousImage = nullptr;
+	// The vpx library does not support anything besides 30hz
 	SelfieFrameRate = 30;
 	const float SelfieLength = 6.0f;
 	SelfieFrameDelay = 1.0f / SelfieFrameRate;
@@ -54,10 +287,23 @@ FLetMeTakeASelfie::FLetMeTakeASelfie()
 	ReadbackBufferIndex = 0;
 	ReadbackBuffers[0] = nullptr;
 	ReadbackBuffers[1] = nullptr;
+
+	bCapturingAudio = false;
+	MMDevice = nullptr;
+	AudioClient = nullptr;
+	AudioCaptureClient = nullptr;
+	WFX = nullptr;
+	AudioTotalFrames = 0;
+	AudioDataLength = 0;
 }
 
 void FLetMeTakeASelfie::OnWorldCreated(UWorld* World, const UWorld::InitializationValues IVS)
 {
+	if (IsRunningCommandlet() || IsRunningDedicatedServer())
+	{
+		return;
+	}
+
 	USceneCaptureComponent2D* CaptureComponent = NewObject<USceneCaptureComponent2D>();
 	CaptureComponent->UpdateBounds();
 	CaptureComponent->AddToRoot();
@@ -102,15 +348,22 @@ void FLetMeTakeASelfie::OnWorldCreated(UWorld* World, const UWorld::Initializati
 		CaptureComponent->RegisterComponentWithWorld(World);
 	}
 
+	TArray<FColor> BlankImage;
+	BlankImage.Empty(SelfieHeight * SelfieWidth);
 	// Allocate the frames once, allocation can be very slow
-	for (int32 i = 0; SelfieImages.Num() < SelfieFramesMax && i < SelfieFramesMax; i++)
+	for (int32 i = 0; SelfieSurfaceImages.Num() < SelfieFramesMax && i < SelfieFramesMax; i++)
 	{
-		SelfieImages.Add(gdImageCreateTrueColor(SelfieWidth, SelfieHeight));
+		SelfieSurfaceImages.Add(BlankImage);
 	}
 }
 
 void FLetMeTakeASelfie::OnWorldDestroyed(UWorld* World)
 {
+	if (IsRunningCommandlet() || IsRunningDedicatedServer())
+	{
+		return;
+	}
+
 	USceneCaptureComponent2D* CaptureComponent = WorldToSceneCaptureComponentMap.FindChecked(World);
 
 	if (CaptureComponent->IsRegistered())
@@ -130,10 +383,23 @@ void FLetMeTakeASelfie::OnWorldDestroyed(UWorld* World)
 }
 
 FWriteWebMSelfieWorker* FWriteWebMSelfieWorker::Runnable = nullptr;
-\
+
 bool FLetMeTakeASelfie::Exec(UWorld* InWorld, const TCHAR* Cmd, FOutputDevice& Ar)
 {
-	if (FParse::Command(&Cmd, TEXT("SELFIEANIM")))
+	if (FParse::Command(&Cmd, TEXT("SELFIEAUDIO")))
+	{
+		if (!bCapturingAudio)
+		{
+			InitAudioLoopback();
+		}
+		else
+		{
+			StopAudioLoopback();
+		}
+
+		return true;
+	}
+	else if (FParse::Command(&Cmd, TEXT("SELFIEANIM")))
 	{
 		if (bTakingAnimatedSelfie && SelfieWorld != InWorld)
 		{
@@ -230,6 +496,11 @@ void FLetMeTakeASelfie::Tick(float DeltaTime)
 		return;
 	}
 	
+	if (bCapturingAudio)
+	{
+		ReadAudioLoopback();
+	}
+
 	if (SelfieTimeWaited < 0.5f)
 	{
 		SelfieTimeWaited += DeltaTime;
@@ -255,16 +526,8 @@ void FLetMeTakeASelfie::Tick(float DeltaTime)
 	{
 		if (bSelfieSurfDataReady)
 		{
-			int i = 0;
+			SelfieSurfaceImages[HeadFrame] = SelfieSurfData;
 
-			gdImagePtr ScreenshotImage = SelfieImages[HeadFrame];
-			for (int y = 0; y < SelfieHeight; y++)
-			for (int x = 0; x < SelfieWidth; x++)
-			{
-				int Color = gdTrueColor(SelfieSurfData[i].R, SelfieSurfData[i].G, SelfieSurfData[i].B);
-				gdImageSetPixel(ScreenshotImage, x, y, Color);
-				i++;
-			}
 			SelfieFrames = FMath::Min(SelfieFrames + 1, SelfieFramesMax);
 			HeadFrame += 1;
 			HeadFrame %= SelfieFramesMax;
@@ -355,8 +618,9 @@ void FLetMeTakeASelfie::Tick(float DeltaTime)
 }
 
 /* based on http://stackoverflow.com/questions/4765436/need-to-create-a-webm-video-from-rgb-frames */
-/* I have no idea how YUV color space works */
-void ARGB_To_YV12(gdImagePtr Image, int nFrameWidth, int nFrameHeight, void *pFullYPlane, void *pDownsampledUPlane, void *pDownsampledVPlane)
+/* I have some small idea how YUV color space works */
+// Should convert to libyuv once I figure it out
+void ARGB_To_YV12(TArray<FColor>& Colors, int nFrameWidth, int nFrameHeight, void *pFullYPlane, void *pDownsampledUPlane, void *pDownsampledVPlane)
 {
 	int nRGBBytes = nFrameWidth * nFrameHeight * 3;
 	unsigned char *pYPlaneOut = (unsigned char*)pFullYPlane;
@@ -364,16 +628,14 @@ void ARGB_To_YV12(gdImagePtr Image, int nFrameWidth, int nFrameHeight, void *pFu
 
 	// never deallocated due to laziness
 	static unsigned char* pRGBData = new unsigned char[nRGBBytes * 3];
-	
+
 	int i = 0;
 	for (int y = 0; y < nFrameHeight; y++)
 	for (int x = 0; x < nFrameWidth; x++)
-	{
-		// gd has image data stored in ARGB
-		int PixelColor = gdImageGetTrueColorPixel(Image, x, y);
-		unsigned char B = gdTrueColorGetBlue(PixelColor);
-		unsigned char G = gdTrueColorGetGreen(PixelColor);
-		unsigned char R = gdTrueColorGetRed(PixelColor);
+	{		
+		unsigned char B = Colors[x + y * nFrameWidth].B;
+		unsigned char G = Colors[x + y * nFrameWidth].G;
+		unsigned char R = Colors[x + y * nFrameWidth].R;
 
 		float y = (float)(R * 66 + G * 129 + B * 25 + 128) / 256 + 16;
 		float u = (float)(R*-38 + G*-74 + B * 112 + 128) / 256 + 128;
@@ -450,7 +712,8 @@ void FLetMeTakeASelfie::WriteWebM()
 	ebml.segment = NULL;
 
 	vpx_image_t raw;
-	if (!vpx_img_alloc(&raw, VPX_IMG_FMT_YV12, width, height, 1))
+	//if (!vpx_img_alloc(&raw, VPX_IMG_FMT_YV12, width, height, 1))
+	if (!vpx_img_alloc(&raw, VPX_IMG_FMT_I420, width, height, 1))
 	{
 		return;
 	}
@@ -489,7 +752,23 @@ void FLetMeTakeASelfie::WriteWebM()
 	
 	for (int i = 0; i < SelfieFrames; i++)
 	{
-		ARGB_To_YV12(SelfieImages[(HeadFrame + i) % SelfieFramesMax], width, height, raw.planes[VPX_PLANE_Y], raw.planes[VPX_PLANE_U], raw.planes[VPX_PLANE_V]);
+		/*
+		libyuv::BGRAToI420((const uint8*)SelfieImages[(HeadFrame + i) % SelfieFramesMax]->tpixels, width,
+			raw.planes[VPX_PLANE_Y], raw.stride[VPX_PLANE_Y],
+			raw.planes[VPX_PLANE_U], raw.stride[VPX_PLANE_U],
+			raw.planes[VPX_PLANE_V], raw.stride[VPX_PLANE_V], width, height);
+			*/
+		/*
+		libyuv::BGRAToI420((const uint8*)SelfieSurfaceImages[(HeadFrame + i) % SelfieFramesMax].GetData(), width,
+			raw.planes[VPX_PLANE_Y], raw.stride[VPX_PLANE_Y],
+			raw.planes[VPX_PLANE_U], raw.stride[VPX_PLANE_U],
+			raw.planes[VPX_PLANE_V], raw.stride[VPX_PLANE_V], width, height);
+			*/
+
+		//ARGB_To_YV12(SelfieImages[(HeadFrame + i) % SelfieFramesMax], width, height, raw.planes[VPX_PLANE_Y], raw.planes[VPX_PLANE_U], raw.planes[VPX_PLANE_V]);
+
+		// hmmm, I420 == YV12 here
+		ARGB_To_YV12(SelfieSurfaceImages[(HeadFrame + i) % SelfieFramesMax], width, height, raw.planes[VPX_PLANE_Y], raw.planes[VPX_PLANE_U], raw.planes[VPX_PLANE_V]);
 
 		vpx_codec_encode(&codec, &raw, frame_cnt, 1, flags, VPX_DL_GOOD_QUALITY);
 		vpx_codec_iter_t iter = NULL;
@@ -572,13 +851,18 @@ void FLetMeTakeASelfie::CopyCurrentFrameToSavedFrames()
 		// Have a new buffer from the GPU
 		int i = 0;
 
-		gdImagePtr ScreenshotImage = SelfieImages[HeadFrame];
+		if (SelfieSurfaceImages[HeadFrame].Num() < SelfieHeight*SelfieWidth)
+		{
+			SelfieSurfaceImages[HeadFrame].Empty();
+			SelfieSurfaceImages[HeadFrame].AddZeroed(SelfieHeight*SelfieWidth);
+		}
 		for (int y = 0; y < SelfieHeight; y++)
 		for (int x = 0; x < SelfieWidth; x++)
 		{
 			FColor& SurfData = ((FColor*)ReadbackBuffers[ReadbackBufferIndex])[i];
-			int Color = gdTrueColor(SurfData.R, SurfData.G, SurfData.B);
-			gdImageSetPixel(ScreenshotImage, x, y, Color);
+
+			SelfieSurfaceImages[HeadFrame][i] = SurfData;
+
 			i++;
 		}
 		SelfieFrames = FMath::Min(SelfieFrames + 1, SelfieFramesMax);

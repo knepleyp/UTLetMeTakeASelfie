@@ -16,7 +16,9 @@ namespace UnrealBuildTool.Rules
                     "Engine",
                     "UnrealTournament",
 					"InputCore",
+					"Slate",
 					"SlateCore",
+					"ShaderCore",
 					"RenderCore",
 					"RHI"
 				}
@@ -24,16 +26,13 @@ namespace UnrealBuildTool.Rules
 
             var LIBPath = Path.Combine("..", "..", "UnrealTournament", "Plugins", "LetMeTakeASelfie", "Source", "lib");
 
-            var GDLibPath = Path.Combine(LIBPath, "libgd.lib");
+            //var GDLibPath = Path.Combine(LIBPath, "libgd.lib");
             var VPXLibPath = Path.Combine(LIBPath, "vpxmd.lib");
             //var VPXLibPath = Path.Combine(LIBPath, "vpxmdd.lib");
             
 			// Lib file
             PublicLibraryPaths.Add(LIBPath);
-            PublicAdditionalLibraries.Add(GDLibPath);
             PublicAdditionalLibraries.Add(VPXLibPath);
-            Definitions.Add("BGDWIN32");
-            //Definitions.Add("NONDLL");
 		}
 	}
 }
