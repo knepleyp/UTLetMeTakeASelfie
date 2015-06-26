@@ -617,62 +617,6 @@ void FLetMeTakeASelfie::Tick(float DeltaTime)
 	}
 }
 
-/* based on http://stackoverflow.com/questions/4765436/need-to-create-a-webm-video-from-rgb-frames */
-/* I have some small idea how YUV color space works */
-// Should convert to libyuv once I figure it out
-void ARGB_To_YV12(TArray<FColor>& Colors, int nFrameWidth, int nFrameHeight, void *pFullYPlane, void *pDownsampledUPlane, void *pDownsampledVPlane)
-{
-	int nRGBBytes = nFrameWidth * nFrameHeight * 3;
-	unsigned char *pYPlaneOut = (unsigned char*)pFullYPlane;
-	int nYPlaneOut = 0;
-
-	// never deallocated due to laziness
-	static unsigned char* pRGBData = new unsigned char[nRGBBytes * 3];
-
-	int i = 0;
-	for (int y = 0; y < nFrameHeight; y++)
-	for (int x = 0; x < nFrameWidth; x++)
-	{		
-		unsigned char B = Colors[x + y * nFrameWidth].B;
-		unsigned char G = Colors[x + y * nFrameWidth].G;
-		unsigned char R = Colors[x + y * nFrameWidth].R;
-
-		float y = (float)(R * 66 + G * 129 + B * 25 + 128) / 256 + 16;
-		float u = (float)(R*-38 + G*-74 + B * 112 + 128) / 256 + 128;
-		float v = (float)(R * 112 + G*-94 + B*-18 + 128) / 256 + 128;
-
-		// NOTE: We're converting pRGBData to YUV in-place here as well as writing out YUV to pFullYPlane/pDownsampledUPlane/pDownsampledVPlane.
-		pRGBData[i + 0] = (unsigned char)y;
-		pRGBData[i + 1] = (unsigned char)u;
-		pRGBData[i + 2] = (unsigned char)v;
-
-		// Write out the Y plane directly here rather than in another loop.
-		pYPlaneOut[nYPlaneOut++] = pRGBData[i + 0];
-
-		i += 3;
-	}
-
-	// Downsample to U and V.
-	int halfHeight = nFrameHeight >> 1;
-	int halfWidth = nFrameWidth >> 1;
-
-	unsigned char *pVPlaneOut = (unsigned char*)pDownsampledVPlane;
-	unsigned char *pUPlaneOut = (unsigned char*)pDownsampledUPlane;
-
-	for (int yPixel = 0; yPixel < halfHeight; yPixel++)
-	{
-		int iBaseSrc = ((yPixel * 2) * nFrameWidth * 3);
-
-		for (int xPixel = 0; xPixel < halfWidth; xPixel++)
-		{
-			pVPlaneOut[yPixel * halfWidth + xPixel] = pRGBData[iBaseSrc + 2];
-			pUPlaneOut[yPixel * halfWidth + xPixel] = pRGBData[iBaseSrc + 1];
-
-			iBaseSrc += 6;
-		}
-	}
-}
-
 void FLetMeTakeASelfie::WriteWebM()
 {		
 	int32 width = SelfieWidth;
@@ -750,25 +694,18 @@ void FLetMeTakeASelfie::WriteWebM()
 	// write some frames
 	int32 frame_cnt = 0;
 	
+	if (SelfieFrames < SelfieFramesMax)
+	{
+		HeadFrame = 0;
+	}
+
 	for (int i = 0; i < SelfieFrames; i++)
 	{
-		/*
-		libyuv::BGRAToI420((const uint8*)SelfieImages[(HeadFrame + i) % SelfieFramesMax]->tpixels, width,
+		// Use libyuv to convert from ARGB to YUV
+		libyuv::ARGBToI420((const uint8*)SelfieSurfaceImages[(HeadFrame + i) % SelfieFramesMax].GetData(), width * 4,
 			raw.planes[VPX_PLANE_Y], raw.stride[VPX_PLANE_Y],
 			raw.planes[VPX_PLANE_U], raw.stride[VPX_PLANE_U],
 			raw.planes[VPX_PLANE_V], raw.stride[VPX_PLANE_V], width, height);
-			*/
-		/*
-		libyuv::BGRAToI420((const uint8*)SelfieSurfaceImages[(HeadFrame + i) % SelfieFramesMax].GetData(), width,
-			raw.planes[VPX_PLANE_Y], raw.stride[VPX_PLANE_Y],
-			raw.planes[VPX_PLANE_U], raw.stride[VPX_PLANE_U],
-			raw.planes[VPX_PLANE_V], raw.stride[VPX_PLANE_V], width, height);
-			*/
-
-		//ARGB_To_YV12(SelfieImages[(HeadFrame + i) % SelfieFramesMax], width, height, raw.planes[VPX_PLANE_Y], raw.planes[VPX_PLANE_U], raw.planes[VPX_PLANE_V]);
-
-		// hmmm, I420 == YV12 here
-		ARGB_To_YV12(SelfieSurfaceImages[(HeadFrame + i) % SelfieFramesMax], width, height, raw.planes[VPX_PLANE_Y], raw.planes[VPX_PLANE_U], raw.planes[VPX_PLANE_V]);
 
 		vpx_codec_encode(&codec, &raw, frame_cnt, 1, flags, VPX_DL_GOOD_QUALITY);
 		vpx_codec_iter_t iter = NULL;
@@ -821,7 +758,7 @@ void FLetMeTakeASelfie::WriteWebM()
 	bStartedAnimatedWritingTask = false;
 	SelfieFrames = 0;
 
-	UE_LOG(LogUTSelfie, Display, TEXT("Selfie complete!"));
+	UE_LOG(LogUTSelfie, Display, TEXT("Selfie complete! %s"), *WebMPath);
 }
 
 // Borrowed from GameLiveStreaming.cpp
